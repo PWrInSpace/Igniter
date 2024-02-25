@@ -93,9 +93,9 @@ void app_main(void)
 {
     bool start_countdown = false;
     bool check_countdown_length = false;
-    spi_device_handle_t lora;
+    spi_device_handle_t spi;
 
-    lora_init(&lora);
+    lora_init(&spi);
 
     // Create the tasks
     xTaskCreate(check_states_and_ignition, "CheckStatesAndIgnitionTask", IGN_STACK_SIZE, NULL, IGN_PRIORITY, NULL);
@@ -205,6 +205,12 @@ esp_err_t spi_init(void)
 
     ret = spi_bus_initialize(VSPI_HOST, &bus_config, SDSPI_DEFAULT_DMA);
 
+    if (ret != ESP_OK)
+    {
+        printf("Failed to initialize the SPI bus\n");
+        return ret;
+    }
+
     return ret;
 }
 
@@ -220,7 +226,13 @@ esp_err_t add_lora_to_spi(spi_device_handle_t* handle)
         .queue_size = 7,            // able to queue 7 transactions at a time; change later to correct size
     };
 
-    ret = spi_bus_add_device(VSPI_HOST, &dev_config, handle);    
+    ret = spi_bus_add_device(VSPI_HOST, &dev_config, handle);  
+
+    if (ret != ESP_OK)
+    {
+        printf("Adding lora to spi failed\n");
+        return ret;
+    }  
 
     return ret;
 }
@@ -228,26 +240,47 @@ esp_err_t add_lora_to_spi(spi_device_handle_t* handle)
 void lora_reset(void)
 {
     gpio_set_level(LORA_RST, 0);
-    // TODO: add delay
+    vTaskDelay(100 / portTICK_PERIOD_MS);
     gpio_set_level(LORA_RST, 1);
-    // TODO: add delay
+    vTaskDelay(100 / portTICK_PERIOD_MS);
 }
 
 esp_err_t lora_init(spi_device_handle_t* handle)
 {
+    esp_err_t ret;
+
     gpio_pad_select_gpio(LORA_RST);
     gpio_set_direction(LORA_RST, GPIO_MODE_OUTPUT);
     gpio_pad_select_gpio(LORA_CS);
     gpio_set_direction(LORA_CS, GPIO_MODE_OUTPUT);
 
-    spi_init();
-    add_lora_to_spi(handle);
-    lora_reset();
+    ret = spi_init();
 
+    if(ret != ESP_OK)
+    {
+        return ret  
+    }
 
+    ret = add_lora_to_spi(handle);
+
+    if (ret != ESP_OK)
+    {
+        return ret;
+    }
+
+    ret = lora_reset();
+
+    if (ret != ESP_OK)
+    {
+        return ret
+    }
+
+    // TODO
+
+    return ESP_OK;
 }
 
-void lora_write_reg(int reg, int val)
+void lora_write_reg(int reg, int val, spi_device_handle_t* spi)
 {
     uint8_t out[2] = { 0x80 | reg, val };
     uint8_t in[2];
@@ -261,11 +294,11 @@ void lora_write_reg(int reg, int val)
     };
 
     gpio_set_level(LORA_CS, 0);
-    spi_device_transmit(__spi, &transaction);
+    spi_device_transmit(spi, &transaction);
     gpio_set_level(LORA_CS, 1);
 }
 
-void lora_read_reg(int reg)
+void lora_read_reg(int reg, spi_device_handle_t* spi)
 {
     uint8_t out[2] = { reg, 0xff };
     uint8_t in[2];
@@ -279,21 +312,6 @@ void lora_read_reg(int reg)
     };
 
     gpio_set_level(LORA_CS, 0);
-    spi_device_transmit(__spi, &transaction);
+    spi_device_transmit(spi, &transaction);
     gpio_set_level(LORA_CS, 1);
-}
-
-void lora_idle(void)
-{
-   lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_STDBY);
-}
-
-void lora_sleep(void)
-{
-    lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_SLEEP);
-}
-
-void lora_receive(void)
-{
-    lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_RX_CONTINUOUS);
 }
