@@ -1,20 +1,37 @@
 // Code for the igniter task
 
-#include <stdbool.h>
-#include <string.h>
-#include <stdlib.h>
-#include <string.h>
 #include <stdio.h>
+
+#include "esp_log.h"
+#include "esp_now_api.h"
+#include "esp_timer.h"
+#include "flash.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "i2c.h"
+#include "sdcard.h"
+#include "spi.h"
+#include "driver/gpio.h"
+#include "w25q64.h"
+#include "console.h"
+#include "flash_task.h"
+#include "sd_task.h"
+#include "state_machine_wrapper.h"
+#include "init_task.h"
+#include "lora_hw_config.h"
+#include "lora_task.h"
+#include <inttypes.h>
+#include "esp_sntp.h"
+#include "freertos/timers.h"
+#include "esp_now_config.h"
 #include "lora.h"
-#include "driver/spi_master.h"
-#include "esp_system.h"
 
 #define LORA_RST GPIO_NUM_18
 #define LORA_CS GPIO_NUM_17
 #define LORA_MISO GPIO_NUM_22
 #define LORA_MOSI GPIO_NUM_23
 #define LORA_SCK GPIO_NUM_19
+#define LORA_D0 GPIO_NUM_16
 
 #define IGN_STACK_SIZE 2048 //TODO: Define the stack size for the igniter task
 #define IGN_PRIORITY 0 //TODO: Define the priority for the igniter task
@@ -35,6 +52,11 @@
 #define TIMEOUT_RESET 100
 
 /*
+* checked regs
+*/
+#define REG_RX_NB_BYTES 0x1d
+
+/*
  * Register definitions
  */
 #define REG_FIFO 0x00
@@ -49,7 +71,7 @@
 #define REG_FIFO_RX_BASE_ADDR 0x0f
 #define REG_FIFO_RX_CURRENT_ADDR 0x10
 #define REG_IRQ_FLAGS 0x12
-#define REG_RX_NB_BYTES 0x13
+
 #define REG_PKT_SNR_VALUE 0x19
 #define REG_PKT_RSSI_VALUE 0x1a
 #define REG_MODEM_CONFIG_1 0x1d
@@ -80,23 +102,23 @@
  */
 #define PA_BOOST 0x80
 
+typedef enum
+{
+    IGNITE = 0x01;
+    CHECK_COUNTDOWN = 0x02;
+} igniter_state_t;
+
 char** parse_gs_info(char* gs_info);
 void check_states_and_ignition(void* param);
 void connection_with_ground_station(void* param);
-esp_err_t spi_init(void);
-esp_err_t add_lora_to_spi(void);
-esp_err_t lora_init(void);
-void lora_reset(void);
-void lora_write_reg(int reg, int val);
+void ignite_rocket(int delay_ms);
+void lora_initialization(void);
+void handle_received_packet(uint8_t* buffer, size_t rx_size);
+static void temp_on_error(ENA_ERROR error);
+static bool init_esp_now(void);
 
 void app_main(void)
 {
-    bool start_countdown = false;
-    bool check_countdown_length = false;
-    spi_device_handle_t spi;
-
-    lora_init(&spi);
-
     // Create the tasks
     xTaskCreate(check_states_and_ignition, "CheckStatesAndIgnitionTask", IGN_STACK_SIZE, NULL, IGN_PRIORITY, NULL);
     xTaskCreate(connection_with_ground_station, "ConnectionWithGroundStationTask", CON_STACK_SIZE, NULL, CON_PRIORITY, NULL);
@@ -107,63 +129,16 @@ void app_main(void)
         {
             //TODO: Add a condition to check if the igniters are armed
             {
-                while (! start_countdown)
-                {
-                    printf("Enter code: "); //will be changed to a message from the ground station
-                    char* gs_info = malloc(sizeof(char) * 100);
-                    scanf("%s", gs_info);
-                    char** parsed_info = parse_gs_info(gs_info);
-
-                    if (strcmp(parsed_info[0], "ign") == 0)
-                    {
-                        int hexValue;
-
-                        sscanf(parsed_info[1], "%x", &hexValue);
-
-                        switch(hexValue)
-                        {
-                            case 0x01: //code for starting the countdown
-                                check_countdown_length = true;
-                                break;
-                            case 0x02: //code for checking the countdown length
-                                if (check_countdown_length)
-                                {
-                                    if (parsed_info[2] == NULL)
-                                    {
-                                        printf("No countdown length provided\n");
-                                        check_countdown_length = false;
-                                        break;
-                                    }
-                                    
-                                    start_countdown = true;
-                                    int countdown_length;
-                                    sscanf(parsed_info[2], "%d", &countdown_length);
-                                }
-                                break;
-                            default:
-                                //handle this message by sending it to the communication task
-                                check_countdown_length = false;
-                                break;
-                        }
-                    }
-
-                    free(parsed_info);
-                    free(gs_info);
-                }
-
-                //TODO: Add a countdown to the ignition
-                {
-                    //TODO: Wait the specified amount of time and ignite the rocket
-                }
+                lora_initialization();
             }
         }
     }
 }
 
-char** parse_gs_info(char* gs_info)
+char** parse_gs_info(char* gs_info, size_t rx_size)
 {
     char* token;
-    char** parsed_info = malloc(sizeof(char*) * 3); //TODO: Allocate memory dynamically
+    char* parsed_info[rx_size];
     int i = 0;
 
     token = strtok(gs_info, ";");
@@ -189,129 +164,119 @@ void connection_with_ground_station(void* param)
     //TODO: Implement logic here
 }
 
-esp_err_t spi_init(void)
+void ignite_rocket(int delay_ms)
 {
-    esp_err_t ret;
+    vTaskDelay(delay_ms / portTICK_PERIOD_MS);
+    // TODO: if any message from gs starting with "ign" is received, then abort ignition
+    // TODO: set level on ignition pin
+}
 
-    spi_bus_config_t bus_config = 
+void lora_initialization(void)
+{
+    spi_init(VSPI_HOST, LORA_MOSI, LORA_MISO, LORA_SCK);
+    lora_hw_spi_add_device(VSPI_HOST);
+    lora_hw_set_gpio();
+    lora_struct_t lora = 
     {
-        .mosi_io_num = LORA_MOSI,
-        .miso_io_num = LORA_MISO,
-        .sclk_io_num = LORA_SCK,
-        .quadwp_io_num = -1,        //check later for real value
-        .quadhd_io_num = -1,        //check later for real value
-        .max_transfer_sz = 0        //check later for real value
+        ._spi_transmit = lora_hw_spi_transmit,
+        ._delay = lora_hw_delay,
+        ._gpio_set_level = lora_hw_gpio_set_level,
+        .log = lora_hw_log,
+        .rst_gpio_num = LORA_RST,
+        .cs_gpio_num = LORA_CS,
+        .d0_gpio_num = LORA_D0,
+        .implicit_header = 0,
+        .frequency = 0
     };
+    init_esp_now();
+    lora_init(&lora);
+    lora_set_frequency(&lora, 915e6);
+    lora_set_bandwidth(&lora, LORA_BW_868_MHz); //change later setting bandwith function to handle this value
+    lora_explicit_header_mode(&lora);
+    lora_enable_crc(&lora);
+    lora_set_receive_mode(&lora);
 
-    ret = spi_bus_initialize(VSPI_HOST, &bus_config, SDSPI_DEFAULT_DMA);
+    uint8_t buffer[255] = {0};
+    size_t rx_size;
 
-    if (ret != ESP_OK)
+    while (1) 
     {
-        printf("Failed to initialize the SPI bus\n");
-        return ret;
+        if (lora_received(&lora) == LORA_OK) 
+        {
+            // TODO: add checking crc errors?
+            rx_size = lora_receive_packet(&lora, buffer, sizeof(buffer));
+            buffer[rx_size] = '\0';
+            handle_received_packet(buffer, rx_size);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        lora_set_receive_mode(&lora);
     }
 
-    return ret;
+    vTaskDelay(pdMS_TO_TICKS(10));
 }
 
-esp_err_t add_lora_to_spi(spi_device_handle_t* handle)
+void handle_received_packet(uint8_t* buffer, size_t rx_size)
 {
-    esp_err_t ret;
+        char** parsed_info = parse_gs_info(buffer, rx_size);
+        bool start_countdown = false;
+        bool check_countdown_length = false;
+        int countdown_length;
 
-    spi_device_interface_config_t dev_config = 
+        if (strcmp(parsed_info[0], "ign") == 0)
+        {
+            int hexValue;
+
+            sscanf(parsed_info[1], "%x", &hexValue);
+
+            switch(hexValue)
+            {
+                case 0x01: //code for starting the countdown
+                    check_countdown_length = true;
+                    break;
+                case 0x02: //code for checking the countdown length
+                    if (check_countdown_length)
+                    {
+                        if (parsed_info[2] == NULL)
+                        {
+                            check_countdown_length = false;
+                            break;
+                        }
+                        
+                        start_countdown = true;
+                        sscanf(parsed_info[2], "%d", &countdown_length);
+                        ignite_rocket(countdown_length);
+                    }
+                    break;
+                default:
+                    //handle this message by sending it to the communication task
+                    check_countdown_length = false;
+                    break;
+            }
+        }
+
+        free(parsed_info);
+}
+
+static void temp_on_error(ENA_ERROR error) 
+{
+    ESP_LOGE(TAG, "ESP NOW ERROR %d", error);
+}
+
+static bool init_esp_now(void) 
+{
+    esp_err_t status = ESP_OK;
+    uint8_t mac_address[] = MCB_MAC;
+    ENA_config_t cfg = 
     {
-        .clock_speed_hz = 10000000, // Clock out at 10 MHz; search later for real value
-        .mode = 0,                  // SPI mode 0; search later for real value
-        .spics_io_num = LORA_CS,    // CS pin
-        .queue_size = 7,            // able to queue 7 transactions at a time; change later to correct size
+      .stack_depth = 8000,
+      .priority = 3,
+      .core_id = APP_CPU_NUM,
     };
+    status |= ENA_init(mac_address);
+    // status |= ENA_register_device(&esp_now_broadcast);
+    // status |= ENA_register_device(&esp_now_pitot);
+    status |= ENA_register_error_handler(temp_on_error);
+    status |= ENA_run(&cfg);
 
-    ret = spi_bus_add_device(VSPI_HOST, &dev_config, handle);  
-
-    if (ret != ESP_OK)
-    {
-        printf("Adding lora to spi failed\n");
-        return ret;
-    }  
-
-    return ret;
-}
-
-void lora_reset(void)
-{
-    gpio_set_level(LORA_RST, 0);
-    vTaskDelay(100 / portTICK_PERIOD_MS);
-    gpio_set_level(LORA_RST, 1);
-    vTaskDelay(100 / portTICK_PERIOD_MS);
-}
-
-esp_err_t lora_init(spi_device_handle_t* handle)
-{
-    esp_err_t ret;
-
-    gpio_pad_select_gpio(LORA_RST);
-    gpio_set_direction(LORA_RST, GPIO_MODE_OUTPUT);
-    gpio_pad_select_gpio(LORA_CS);
-    gpio_set_direction(LORA_CS, GPIO_MODE_OUTPUT);
-
-    ret = spi_init();
-
-    if(ret != ESP_OK)
-    {
-        return ret  
-    }
-
-    ret = add_lora_to_spi(handle);
-
-    if (ret != ESP_OK)
-    {
-        return ret;
-    }
-
-    ret = lora_reset();
-
-    if (ret != ESP_OK)
-    {
-        return ret
-    }
-
-    // TODO
-
-    return ESP_OK;
-}
-
-void lora_write_reg(int reg, int val, spi_device_handle_t* spi)
-{
-    uint8_t out[2] = { 0x80 | reg, val };
-    uint8_t in[2];
-
-    spi_transaction_t transaction = 
-    {
-        .flags = 0,
-        .length = 8 * sizeof(out),
-        .tx_buffer = out,
-        .rx_buffer = in  
-    };
-
-    gpio_set_level(LORA_CS, 0);
-    spi_device_transmit(spi, &transaction);
-    gpio_set_level(LORA_CS, 1);
-}
-
-void lora_read_reg(int reg, spi_device_handle_t* spi)
-{
-    uint8_t out[2] = { reg, 0xff };
-    uint8_t in[2];
-
-    spi_transaction_t transaction = 
-    {
-        .flags = 0,
-        .length = 8 * sizeof(out),
-        .tx_buffer = out,
-        .rx_buffer = in  
-    };
-
-    gpio_set_level(LORA_CS, 0);
-    spi_device_transmit(spi, &transaction);
-    gpio_set_level(LORA_CS, 1);
+    return status == ESP_OK ? true : false;
 }
